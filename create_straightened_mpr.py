@@ -1,6 +1,22 @@
 # =========================================================
-# GPU-ACCELERATED STRAIGHTENED MPR GENERATION
-# FIXED CENTERLINE ORDERING + NIFTI SHAPE ISSUE
+# GPU-ACCELERATED SEPARATE ARTERY STRAIGHTENED MPR
+# =========================================================
+#
+# INPUTS:
+#   1. CT Volume
+#   2. Artery 1 Centerline
+#   3. Artery 2 Centerline
+#   4. Shared Radius Map
+#
+# CENTERLINE NAMES:
+#   Img_001_artery_1_centerline.nii.gz
+#   Img_001_artery_2_centerline.nii.gz
+#
+# OUTPUTS:
+#   outputs/run_X/
+#       artery_1/
+#       artery_2/
+#
 # =========================================================
 
 import os
@@ -18,29 +34,31 @@ from scipy.spatial.transform import Rotation
 # CONFIG
 # =========================================================
 
-CT_DIR = r"D:\AICOE- Ishan\Codes\data\ICAS\ct_volumes"
+CT_DIR = (
+    r"D:\AICOE- Ishan\Codes\data_trail\ct"
+)
 
 CENTERLINE_DIR = (
-    r"D:\AICOE- Ishan\Codes"
-    r"\centerline_extraction_and_reconstruction"
-    r"\outputs\run_12\centerlines\ICAS"
+    r"D:\AICOE- Ishan\Codes\data_trail\centerline"
 )
 
 RADIUS_DIR = (
-    r"D:\AICOE- Ishan\Codes"
-    r"\centerline_extraction_and_reconstruction"
-    r"\radius\run_12\ICAS"
+    r"D:\AICOE- Ishan\Codes\data_trail\radius"
 )
 
 OUTPUT_ROOT = "outputs"
 
-RESAMPLE_STEP_MM = 0.5
+# =========================================================
+# PARAMETERS
+# =========================================================
 
-CROSS_SECTION_SIZE = 64
+RESAMPLE_STEP_MM = 1.0
+
+CROSS_SECTION_SIZE = 48
 
 PLANE_SCALE = 4.0
 
-MAX_SLICES = 5000
+MAX_SLICES = 2500
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -50,7 +68,7 @@ if DEVICE == "cuda":
     print(torch.cuda.get_device_name(0))
 
 # =========================================================
-# CREATE RUN FOLDER
+# CREATE OUTPUT RUN
 # =========================================================
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
@@ -77,15 +95,18 @@ RUN_DIR = os.path.join(
     f"run_{run_id}"
 )
 
-STRAIGHTENED_CT_DIR = os.path.join(
+ARTERY1_OUT_DIR = os.path.join(
     RUN_DIR,
-    "straightened_ct"
+    "artery_1"
 )
 
-os.makedirs(
-    STRAIGHTENED_CT_DIR,
-    exist_ok=True
+ARTERY2_OUT_DIR = os.path.join(
+    RUN_DIR,
+    "artery_2"
 )
+
+os.makedirs(ARTERY1_OUT_DIR, exist_ok=True)
+os.makedirs(ARTERY2_OUT_DIR, exist_ok=True)
 
 # =========================================================
 # UTILITIES
@@ -112,8 +133,10 @@ def load_nifti(path):
 
 def save_nifti(data, affine, path):
 
+    data = data.astype(np.float32)
+
     nii = nib.Nifti1Image(
-        data.astype(np.float32),
+        data,
         affine
     )
 
@@ -137,7 +160,7 @@ def extract_centerline_points(centerline_volume):
         return coords
 
     # =====================================================
-    # GREEDY NEAREST-NEIGHBOR ORDERING
+    # GREEDY ORDERING
     # =====================================================
 
     ordered = [coords[0]]
@@ -169,12 +192,12 @@ def extract_centerline_points(centerline_volume):
 
 
 # =========================================================
-# SMOOTH + RESAMPLE CENTERLINE
+# SMOOTH + RESAMPLE
 # =========================================================
 
 def smooth_resample_centerline(
     points,
-    step=0.5
+    step=1.0
 ):
 
     points = np.array(points)
@@ -221,12 +244,8 @@ def smooth_resample_centerline(
 
     print(
         f"Estimated artery length: "
-        f"{total_length:.2f} voxels"
+        f"{total_length:.2f}"
     )
-
-    # =====================================================
-    # PREVENT EXPLOSION
-    # =====================================================
 
     num_samples = min(
         int(total_length / step),
@@ -234,7 +253,7 @@ def smooth_resample_centerline(
     )
 
     print(
-        f"Resampled slices: "
+        f"Final slice count: "
         f"{num_samples}"
     )
 
@@ -381,7 +400,7 @@ def compute_frames(points):
 
 
 # =========================================================
-# GPU STRAIGHTENED MPR
+# GPU MPR
 # =========================================================
 
 def create_straightened_mpr_gpu(
@@ -404,15 +423,6 @@ def create_straightened_mpr_gpu(
     )
 
     D, H, W = ct.shape
-
-    print(
-        f"\nFinal slice count: "
-        f"{len(centerline_points)}"
-    )
-
-    # =====================================================
-    # CT TO GPU
-    # =====================================================
 
     ct_tensor = torch.tensor(
         ct,
@@ -438,7 +448,9 @@ def create_straightened_mpr_gpu(
 
         x, y, z = p
 
-        radius = 5
+        # =================================================
+        # RADIUS
+        # =================================================
 
         try:
 
@@ -448,13 +460,21 @@ def create_straightened_mpr_gpu(
                 int(x)
             ]
 
+            if radius <= 0:
+                radius = 5
+
         except:
-            pass
+
+            radius = 5
 
         plane_half = max(
             radius * PLANE_SCALE,
             8
         )
+
+        # =================================================
+        # CROSS SECTION GRID
+        # =================================================
 
         coords = np.linspace(
             -plane_half,
@@ -481,10 +501,6 @@ def create_straightened_mpr_gpu(
         sx = sample_points[..., 0]
         sy = sample_points[..., 1]
         sz = sample_points[..., 2]
-
-        # =================================================
-        # NORMALIZE TO [-1, 1]
-        # =================================================
 
         gx = (sx / (W - 1)) * 2 - 1
         gy = (sy / (H - 1)) * 2 - 1
@@ -537,6 +553,76 @@ def create_straightened_mpr_gpu(
 
 
 # =========================================================
+# PROCESS SINGLE ARTERY
+# =========================================================
+
+def process_artery(
+    artery_name,
+    centerline_path,
+    output_dir,
+    ct,
+    radius_map,
+    case_name
+):
+
+    if centerline_path is None:
+
+        print(
+            f"{artery_name} centerline not found"
+        )
+
+        return
+
+    centerline_vol, _, _ = load_nifti(
+        centerline_path
+    )
+
+    centerline_points = (
+        extract_centerline_points(
+            centerline_vol
+        )
+    )
+
+    print(
+        f"{artery_name} raw points: "
+        f"{len(centerline_points)}"
+    )
+
+    if len(centerline_points) < 5:
+
+        print("Too few points")
+
+        return
+
+    straightened = (
+        create_straightened_mpr_gpu(
+            ct,
+            centerline_points,
+            radius_map
+        )
+    )
+
+    print(
+        f"\n{artery_name} output shape: "
+        f"{straightened.shape}"
+    )
+
+    output_path = os.path.join(
+        output_dir,
+        f"{case_name}_{artery_name}_straightened.nii.gz"
+    )
+
+    save_nifti(
+        straightened,
+        np.eye(4),
+        output_path
+    )
+
+    print("\nSaved:")
+    print(output_path)
+
+
+# =========================================================
 # PROCESS ALL CASES
 # =========================================================
 
@@ -553,11 +639,6 @@ for ct_path in ct_files:
 
     base = os.path.basename(ct_path)
 
-    # Example:
-    # Img_003_0000.nii.gz
-    #
-    # -> Img_003
-
     match = re.match(
         r"(Img_\d+)",
         base
@@ -572,39 +653,58 @@ for ct_path in ct_files:
 
         continue
 
-    name = match.group(1)
+    case_name = match.group(1)
 
     print("\n=================================")
-    print(f"Processing {name}")
+    print(f"Processing {case_name}")
     print("=================================")
 
-    centerline_path = os.path.join(
-        CENTERLINE_DIR,
-        f"{name}_centerlines_all.nii.gz"
+    # =====================================================
+    # FIND CENTERLINES AUTOMATICALLY
+    # =====================================================
+
+    artery1_candidates = glob.glob(
+        os.path.join(
+            CENTERLINE_DIR,
+            f"{case_name}*artery_1_centerline.nii*"
+        )
+    )
+
+    artery2_candidates = glob.glob(
+        os.path.join(
+            CENTERLINE_DIR,
+            f"{case_name}*artery_2_centerline.nii*"
+        )
+    )
+
+    artery1_centerline_path = (
+        artery1_candidates[0]
+        if len(artery1_candidates) > 0
+        else None
+    )
+
+    artery2_centerline_path = (
+        artery2_candidates[0]
+        if len(artery2_candidates) > 0
+        else None
     )
 
     radius_path = os.path.join(
         RADIUS_DIR,
-        f"{name}_radius_map.nii.gz"
+        f"{case_name}_radius_map.nii.gz"
     )
 
-    if not os.path.exists(centerline_path):
-
-        print("Centerline not found")
-
-        continue
-
     # =====================================================
-    # LOAD DATA
+    # LOAD CT
     # =====================================================
 
     ct, affine, header = load_nifti(
         ct_path
     )
 
-    centerline_vol, _, _ = load_nifti(
-        centerline_path
-    )
+    # =====================================================
+    # LOAD RADIUS MAP
+    # =====================================================
 
     if os.path.exists(radius_path):
 
@@ -612,60 +712,41 @@ for ct_path in ct_files:
             radius_path
         )
 
+        print("Loaded shared radius map")
+
     else:
 
-        radius_map = np.zeros_like(ct)
-
-    centerline_points = (
-        extract_centerline_points(
-            centerline_vol
-        )
-    )
-
-    print(
-        f"Raw centerline points: "
-        f"{len(centerline_points)}"
-    )
-
-    if len(centerline_points) < 5:
-
-        print("Too few points")
-
+        print("Radius map missing")
         continue
 
     # =====================================================
-    # GENERATE MPR
+    # PROCESS ARTERY 1
     # =====================================================
 
-    straightened = (
-        create_straightened_mpr_gpu(
-            ct,
-            centerline_points,
-            radius_map
-        )
-    )
+    print("\n========== ARTERY 1 ==========")
 
-    print(
-        f"\nOutput shape: "
-        f"{straightened.shape}"
+    process_artery(
+        artery_name="artery_1",
+        centerline_path=artery1_centerline_path,
+        output_dir=ARTERY1_OUT_DIR,
+        ct=ct,
+        radius_map=radius_map,
+        case_name=case_name
     )
 
     # =====================================================
-    # SAVE
+    # PROCESS ARTERY 2
     # =====================================================
 
-    output_path = os.path.join(
-        STRAIGHTENED_CT_DIR,
-        f"{name}_straightened_ct.nii.gz"
-    )
+    print("\n========== ARTERY 2 ==========")
 
-    save_nifti(
-        straightened,
-        np.eye(4),
-        output_path
+    process_artery(
+        artery_name="artery_2",
+        centerline_path=artery2_centerline_path,
+        output_dir=ARTERY2_OUT_DIR,
+        ct=ct,
+        radius_map=radius_map,
+        case_name=case_name
     )
-
-    print("\nSaved:")
-    print(output_path)
 
 print("\nDONE")
